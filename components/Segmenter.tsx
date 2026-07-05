@@ -2,19 +2,18 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import * as ort from 'onnxruntime-web';
-import { UploadCloud, Loader2, MousePointer2 } from 'lucide-react';
+import { Upload, Activity, Crosshair } from 'lucide-react';
 
-// Configure ONNX Runtime
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
-ort.env.wasm.numThreads = 1;
 
-const ENCODER_URL = "https://huggingface.co/AnberAziz5/sam-web-models/resolve/main/sam_image_encoder_quantized.onnx";
+// The URL of your Python FastAPI Server
+const API_URL = "https://anberaziz5-sam-medical-backend.hf.space/api/encode"; 
+// The tiny 16MB decoder running in the browser
 const DECODER_URL = "https://huggingface.co/AnberAziz5/sam-web-models/resolve/main/sam_mask_decoder_final.onnx";
 
 export default function Segmenter() {
-    const [status, setStatus] = useState("Waiting for image...");
+    const [status, setStatus] = useState("SYSTEM STANDBY");
     const [image, setImage] = useState<HTMLImageElement | null>(null);
-    const [encoderSession, setEncoderSession] = useState<ort.InferenceSession | null>(null);
     const [decoderSession, setDecoderSession] = useState<ort.InferenceSession | null>(null);
     const [imageEmbedding, setImageEmbedding] = useState<ort.Tensor | null>(null);
     const [isProcessing, setIsProcessing] = useState(false);
@@ -22,32 +21,22 @@ export default function Segmenter() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const maskCanvasRef = useRef<HTMLCanvasElement>(null);
 
+    // Only load the tiny 16MB Decoder locally
     useEffect(() => {
-        async function loadModels() {
+        async function loadDecoder() {
             try {
-                setStatus("Downloading Quantized Encoder (~95MB)...");
-                const encSession = await ort.InferenceSession.create(ENCODER_URL, {
-                    executionProviders: ['wasm'], // Cleaned up to stop WebGL console spam
-                    graphOptimizationLevel: 'all',
-                    enableCpuMemArena: true,
-                    enableMemPattern: true,
-                    executionMode: 'sequential'
-                });
-                setEncoderSession(encSession);
-
-                setStatus("Downloading & Compiling Decoder...");
+                setStatus("INITIALIZING DECODER ENGINE...");
                 const decSession = await ort.InferenceSession.create(DECODER_URL, {
                     executionProviders: ['wasm']
                 });
                 setDecoderSession(decSession);
-
-                setStatus("Models loaded. Ready for medical image.");
-            } catch (error: any) {
-                console.error("Model loading failed:", error);
-                setStatus(`Error loading models: ${error.message || error}`);
+                setStatus("READY. AWAITING SCAN UPLOAD.");
+            } catch (error) {
+                console.error(error);
+                setStatus("ERR: DECODER INITIALIZATION FAILED.");
             }
         }
-        loadModels();
+        loadDecoder();
     }, []);
 
     const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -59,7 +48,6 @@ export default function Segmenter() {
         img.src = url;
         img.onload = async () => {
             setImage(img);
-            
             const canvas = canvasRef.current;
             const maskCanvas = maskCanvasRef.current;
             if (!canvas || !maskCanvas) return;
@@ -71,68 +59,51 @@ export default function Segmenter() {
             
             const ctx = canvas.getContext('2d');
             ctx?.drawImage(img, 0, 0);
+            maskCanvas.getContext('2d')?.clearRect(0, 0, img.width, img.height);
 
-            const maskCtx = maskCanvas.getContext('2d');
-            maskCtx?.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-
-            await runEncoder(img);
+            await sendToCloudEngine(file);
         };
     };
 
-    const runEncoder = async (img: HTMLImageElement) => {
-        if (!encoderSession) return;
+    const sendToCloudEngine = async (file: File) => {
         setIsProcessing(true);
-        setStatus("Processing image through LoRA Encoder... (This takes heavy RAM, wait 15-30s)");
-
-        // Force DOM to paint the status update before locking the CPU
-        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        setStatus("UPLOADING TO CLOUD COMPUTE CLUSTER...");
 
         try {
-            const offscreen = document.createElement('canvas');
-            offscreen.width = 1024;
-            offscreen.height = 1024;
-            const ctx = offscreen.getContext('2d');
-            if (!ctx) return;
+            const formData = new FormData();
+            formData.append("file", file);
+
+            setStatus("EXECUTING LORA VISION TRANSFORMER...");
+            const response = await fetch(API_URL, {
+                method: 'POST',
+                body: formData,
+            });
+
+            if (!response.ok) throw new Error("Cloud compute failed");
             
-            ctx.drawImage(img, 0, 0, 1024, 1024);
-            const imgData = ctx.getImageData(0, 0, 1024, 1024);
-
-            const tensorObj = new Float32Array(1 * 3 * 1024 * 1024);
-            const mean = [0.485, 0.456, 0.406];
-            const std = [0.229, 0.224, 0.225];
-
-            for (let i = 0; i < 1024; i++) {
-                for (let j = 0; j < 1024; j++) {
-                    const idx = (i * 1024 + j) * 4;
-                    const r = imgData.data[idx] / 255.0;
-                    const g = imgData.data[idx + 1] / 255.0;
-                    const b = imgData.data[idx + 2] / 255.0;
-                    
-                    tensorObj[i * 1024 + j] = (r - mean[0]) / std[0]; 
-                    tensorObj[1024 * 1024 + i * 1024 + j] = (g - mean[1]) / std[1]; 
-                    tensorObj[2 * 1024 * 1024 + i * 1024 + j] = (b - mean[2]) / std[2]; 
-                }
-            }
-
-            const inputTensor = new ort.Tensor('float32', tensorObj, [1, 3, 1024, 1024]);
-            const results = await encoderSession.run({ input_image: inputTensor });
+            setStatus("DECODING TENSOR MATRIX...");
+            const data = await response.json();
             
-            setImageEmbedding(results.image_embeddings);
-            setStatus("Ready! Click anywhere on the image to segment polyps/tumors.");
-        } catch (error: any) {
-            console.error("Encoder failed:", error);
-            alert(`Encoder failed: ${error.message || "Out of Memory"}`);
-            setStatus("Encoder failed. Check DevTools console.");
+            // Efficiently convert Base64 back to Float32 Tensor
+            const binaryString = window.atob(data.embedding_b64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+            const floatArray = new Float32Array(bytes.buffer);
+            
+            const tensor = new ort.Tensor('float32', floatArray, [1, 256, 64, 64]);
+            setImageEmbedding(tensor);
+            
+            setStatus("TARGET ACQUIRED. CLICK SCAN TO SEGMENT.");
+        } catch (error) {
+            console.error(error);
+            setStatus("ERR: CLOUD COMPUTE DISCONNECTED.");
         }
         setIsProcessing(false);
     };
 
     const handleCanvasClick = async (e: React.MouseEvent<HTMLCanvasElement>) => {
-        // Prevent early exit silence: log exactly why it rejects the click
-        if (!decoderSession || !imageEmbedding || !image || isProcessing) {
-            console.log("Click ignored. State:", { hasDecoder: !!decoderSession, hasEmbedding: !!imageEmbedding, isProcessing });
-            return;
-        }
+        if (!decoderSession || !imageEmbedding || !image || isProcessing) return;
         
         const canvas = maskCanvasRef.current;
         if (!canvas) return;
@@ -143,40 +114,31 @@ export default function Segmenter() {
         const x = (e.clientX - rect.left) * scaleX;
         const y = (e.clientY - rect.top) * scaleY;
 
-        setStatus(`Segmenting at (${Math.round(x)}, ${Math.round(y)})...`);
+        setStatus(`COMPUTING SEGMENTATION AT COORDS [${Math.round(x)}, ${Math.round(y)}]...`);
 
         const maskCtx = canvas.getContext('2d');
         if (!maskCtx) return;
 
-        // Visual click confirmation (draws a tiny red dot so you know it registered)
-        maskCtx.fillStyle = 'red';
+        // Draw crosshair indicator
+        maskCtx.fillStyle = '#f97316'; // Orange accent
         maskCtx.beginPath();
-        maskCtx.arc(x, y, 5, 0, 2 * Math.PI);
+        maskCtx.arc(x, y, 4, 0, 2 * Math.PI);
         maskCtx.fill();
         
         try {
             const pointCoords = new Float32Array([x, y]);
             const pointLabels = new Float32Array([1]); 
-            const pointCoordsTensor = new ort.Tensor('float32', pointCoords, [1, 1, 2]);
-            const pointLabelsTensor = new ort.Tensor('float32', pointLabels, [1, 1]);
-            
-            const maskInput = new ort.Tensor('float32', new Float32Array(256 * 256), [1, 1, 256, 256]);
-            const hasMaskInput = new ort.Tensor('float32', new Float32Array([0]), [1]);
-            
-            const origImSize = new ort.Tensor('float32', new Float32Array([image.height, image.width]), [2]);
-
             const feeds = {
                 image_embeddings: imageEmbedding,
-                point_coords: pointCoordsTensor,
-                point_labels: pointLabelsTensor,
-                mask_input: maskInput,
-                has_mask_input: hasMaskInput,
-                orig_im_size: origImSize
+                point_coords: new ort.Tensor('float32', pointCoords, [1, 1, 2]),
+                point_labels: new ort.Tensor('float32', pointLabels, [1, 1]),
+                mask_input: new ort.Tensor('float32', new Float32Array(256 * 256), [1, 1, 256, 256]),
+                has_mask_input: new ort.Tensor('float32', new Float32Array([0]), [1]),
+                orig_im_size: new ort.Tensor('float32', new Float32Array([image.height, image.width]), [2])
             };
 
             const results = await decoderSession.run(feeds);
             const maskTensor = results.masks; 
-
             const maskData = maskTensor.data as Float32Array;
             const h = maskTensor.dims[2];
             const w = maskTensor.dims[3];
@@ -184,60 +146,92 @@ export default function Segmenter() {
             const imgData = maskCtx.createImageData(w, h);
             for(let i = 0; i < h * w; i++) {
                 if(maskData[i] > 0.0) { 
-                    imgData.data[i * 4 + 0] = 34;   
-                    imgData.data[i * 4 + 1] = 197;  
-                    imgData.data[i * 4 + 2] = 94;   
-                    imgData.data[i * 4 + 3] = 150;  
+                    imgData.data[i * 4 + 0] = 249; // R (Orange)
+                    imgData.data[i * 4 + 1] = 115; // G
+                    imgData.data[i * 4 + 2] = 22;  // B
+                    imgData.data[i * 4 + 3] = 160; // Alpha
                 } else {
                     imgData.data[i * 4 + 3] = 0;    
                 }
             }
             maskCtx.putImageData(imgData, 0, 0);
-            setStatus("Ready! Click anywhere else to re-segment.");
+            setStatus("SEGMENTATION COMPLETE. AWAITING NEXT TARGET.");
 
-        } catch (err: any) {
-            console.error("DECODER ERROR:", err);
-            alert(`Decoder failed: ${err.message || err}`);
-            setStatus("Decoder failed. Check console.");
+        } catch (err) {
+            console.error(err);
+            setStatus("ERR: DECODER CORE FAULT.");
         }
     };
 
     return (
-        <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900 text-white p-8">
-            <div className="max-w-4xl w-full bg-gray-800 rounded-xl shadow-2xl p-6 border border-gray-700">
-                <div className="text-center mb-6">
-                    <h1 className="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-green-400 to-blue-500">
-                        Zero-Cost LoRA-Tuned Medical SAM
-                    </h1>
-                    <p className="text-gray-400 mt-2">Browser-native, $0 Inference via ONNX Runtime</p>
+        <div className="min-h-screen bg-[#050505] text-zinc-300 font-sans tracking-tight p-8 flex flex-col items-center">
+            
+            {/* Minimalist Header */}
+            <div className="w-full max-w-5xl mb-12 border-b border-zinc-800 pb-6 flex justify-between items-end">
+                <div>
+                    <h1 className="text-3xl font-medium text-white tracking-tight">Diagnostic <span className="text-orange-500 font-normal">Engine</span></h1>
+                    <p className="text-zinc-500 text-sm mt-2 uppercase tracking-widest font-mono">Medical Segmentation / LoRA Architecture</p>
                 </div>
-
-                <div className="bg-gray-900 p-4 rounded-lg flex items-center justify-center space-x-3 mb-6 border border-gray-700">
-                    {isProcessing ? <Loader2 className="animate-spin text-blue-400" /> : <MousePointer2 className="text-green-400" />}
-                    <span className="font-mono text-sm">{status}</span>
+                <div className="flex items-center space-x-2 text-xs font-mono">
+                    <Activity className={`w-4 h-4 ${isProcessing ? 'text-orange-500 animate-pulse' : 'text-zinc-600'}`} />
+                    <span className={isProcessing ? 'text-orange-500' : 'text-zinc-600'}>{status}</span>
                 </div>
+            </div>
 
-                {!image && (
-                    <div className="flex items-center justify-center w-full">
-                        <label className="flex flex-col items-center justify-center w-full h-64 border-2 border-gray-600 border-dashed rounded-lg cursor-pointer bg-gray-700 hover:bg-gray-600 transition-all">
-                            <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                                <UploadCloud className="w-12 h-12 text-gray-400 mb-3" />
-                                <p className="mb-2 text-sm text-gray-400"><span className="font-semibold">Click to upload</span> a medical scan</p>
-                            </div>
+            <div className="w-full max-w-5xl grid grid-cols-1 md:grid-cols-3 gap-8">
+                
+                {/* Control Panel (Sidebar) */}
+                <div className="col-span-1 space-y-6">
+                    <div className="bg-[#0A0A0A] border border-zinc-800 p-6 rounded-sm">
+                        <h2 className="text-white text-sm uppercase tracking-widest mb-4 border-b border-zinc-800 pb-2">Data Input</h2>
+                        
+                        <label className="flex flex-col items-center justify-center w-full h-32 border border-zinc-700 border-dashed hover:border-orange-500 cursor-pointer transition-colors bg-[#0f0f0f] hover:bg-[#141414] rounded-sm group">
+                            <Upload className="w-5 h-5 text-zinc-500 group-hover:text-orange-500 transition-colors mb-2" />
+                            <span className="text-xs text-zinc-400 group-hover:text-zinc-300">SELECT MEDICAL SCAN</span>
                             <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                         </label>
                     </div>
-                )}
 
-                {/* FIXED CSS WRAPPER: inline-block locks the container strictly to the canvas size */}
-                <div className="flex justify-center w-full">
-                    <div className="relative inline-block max-w-full overflow-hidden rounded-lg bg-black border border-gray-700 shadow-lg">
-                        <canvas ref={canvasRef} className="block max-w-full h-auto z-10" />
-                        <canvas 
-                            ref={maskCanvasRef} 
-                            onClick={handleCanvasClick}
-                            className={`absolute top-0 left-0 w-full h-full z-20 ${imageEmbedding && !isProcessing ? 'cursor-crosshair' : 'cursor-wait'}`} 
-                        />
+                    <div className="bg-[#0A0A0A] border border-zinc-800 p-6 rounded-sm">
+                        <h2 className="text-white text-sm uppercase tracking-widest mb-4 border-b border-zinc-800 pb-2">Telemetry</h2>
+                        <div className="space-y-3 text-xs font-mono text-zinc-500">
+                            <div className="flex justify-between">
+                                <span>Engine:</span>
+                                <span className={imageEmbedding ? "text-orange-500" : "text-zinc-600"}>{imageEmbedding ? "ONLINE" : "STANDBY"}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span>Decoder:</span>
+                                <span className={decoderSession ? "text-green-500" : "text-zinc-600"}>{decoderSession ? "LOADED" : "PENDING"}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span>Latency:</span>
+                                <span className="text-zinc-400">{'< 50ms (Edge)'}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Main Viewport */}
+                <div className="col-span-1 md:col-span-2">
+                    <div className="bg-[#0A0A0A] border border-zinc-800 rounded-sm p-1 min-h-[500px] flex items-center justify-center relative overflow-hidden">
+                        
+                        {!image && (
+                            <div className="flex flex-col items-center justify-center text-zinc-600">
+                                <Crosshair className="w-12 h-12 mb-4 opacity-50" strokeWidth={1} />
+                                <p className="text-sm uppercase tracking-widest font-mono">No Active Target</p>
+                            </div>
+                        )}
+
+                        {/* Image & Canvas Wrapper */}
+                        <div className={`relative inline-block max-w-full shadow-2xl ${isProcessing && 'opacity-50 transition-opacity'}`}>
+                            <canvas ref={canvasRef} className="block max-w-full h-auto" />
+                            <canvas 
+                                ref={maskCanvasRef} 
+                                onClick={handleCanvasClick}
+                                className={`absolute top-0 left-0 w-full h-full ${imageEmbedding && !isProcessing ? 'cursor-crosshair' : 'cursor-not-allowed'}`} 
+                            />
+                        </div>
+
                     </div>
                 </div>
             </div>
