@@ -6,11 +6,9 @@ import { Upload, Activity, Crosshair } from 'lucide-react';
 
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
 
-// The URL of your Python FastAPI Server
+// >>> PUT YOUR HUGGING FACE URL HERE <<<
 const API_URL = "https://anberaziz5-sam-medical-backend.hf.space/api/encode"; 
-// The tiny 16MB decoder running in the browser
-const DECODER_URL = "https://huggingface.co/AnberAziz5/sam-web-models/resolve/main/sam_mask_decoder_final.onnx";
-
+const DECODER_URL = "https://huggingface.co/AnberAziz5/sam-web-models/resolve/main/sam_mask_decoder_quantized.onnx";
 export default function Segmenter() {
     const [status, setStatus] = useState("SYSTEM STANDBY");
     const [image, setImage] = useState<HTMLImageElement | null>(null);
@@ -21,7 +19,6 @@ export default function Segmenter() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const maskCanvasRef = useRef<HTMLCanvasElement>(null);
 
-    // Only load the tiny 16MB Decoder locally
     useEffect(() => {
         async function loadDecoder() {
             try {
@@ -31,9 +28,9 @@ export default function Segmenter() {
                 });
                 setDecoderSession(decSession);
                 setStatus("READY. AWAITING SCAN UPLOAD.");
-            } catch (error) {
-                console.error(error);
-                setStatus("ERR: DECODER INITIALIZATION FAILED.");
+            } catch (error: any) {
+                console.error("Decoder Init Error:", error);
+                setStatus(`ERR: DECODER FAILED. ${error.message || error}`);
             }
         }
         loadDecoder();
@@ -48,6 +45,10 @@ export default function Segmenter() {
         img.src = url;
         img.onload = async () => {
             setImage(img);
+            
+            // Force React to render the image to the screen immediately
+            await new Promise(resolve => setTimeout(resolve, 50));
+
             const canvas = canvasRef.current;
             const maskCanvas = maskCanvasRef.current;
             if (!canvas || !maskCanvas) return;
@@ -70,33 +71,53 @@ export default function Segmenter() {
         setStatus("UPLOADING TO CLOUD COMPUTE CLUSTER...");
 
         try {
+            console.log("1. Preparing FormData");
             const formData = new FormData();
             formData.append("file", file);
 
             setStatus("EXECUTING LORA VISION TRANSFORMER...");
+            console.log("2. Sending POST request to:", API_URL);
+            
             const response = await fetch(API_URL, {
                 method: 'POST',
                 body: formData,
             });
 
-            if (!response.ok) throw new Error("Cloud compute failed");
+            console.log("3. Received response. Status:", response.status);
+
+            if (!response.ok) {
+                const errText = await response.text();
+                throw new Error(`Server returned ${response.status}: ${errText}`);
+            }
             
             setStatus("DECODING TENSOR MATRIX...");
+            console.log("4. Parsing JSON");
             const data = await response.json();
             
-            // Efficiently convert Base64 back to Float32 Tensor
+            if (!data.embedding_b64) {
+                throw new Error("No embedding_b64 found in server response.");
+            }
+
+            console.log("5. Converting Base64 to ArrayBuffer (This takes a second)");
+            // Safer memory conversion
             const binaryString = window.atob(data.embedding_b64);
             const len = binaryString.length;
             const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
             const floatArray = new Float32Array(bytes.buffer);
             
+            console.log("6. Creating ONNX Tensor");
             const tensor = new ort.Tensor('float32', floatArray, [1, 256, 64, 64]);
             setImageEmbedding(tensor);
             
             setStatus("TARGET ACQUIRED. CLICK SCAN TO SEGMENT.");
-        } catch (error) {
-            console.error(error);
+            console.log("7. Success. Ready for clicks.");
+
+        } catch (error: any) {
+            console.error("Cloud Compute Error:", error);
+            alert(`CLOUD ERROR: ${error.message || error}`);
             setStatus("ERR: CLOUD COMPUTE DISCONNECTED.");
         }
         setIsProcessing(false);
@@ -119,8 +140,7 @@ export default function Segmenter() {
         const maskCtx = canvas.getContext('2d');
         if (!maskCtx) return;
 
-        // Draw crosshair indicator
-        maskCtx.fillStyle = '#f97316'; // Orange accent
+        maskCtx.fillStyle = '#f97316'; 
         maskCtx.beginPath();
         maskCtx.arc(x, y, 4, 0, 2 * Math.PI);
         maskCtx.fill();
@@ -146,10 +166,10 @@ export default function Segmenter() {
             const imgData = maskCtx.createImageData(w, h);
             for(let i = 0; i < h * w; i++) {
                 if(maskData[i] > 0.0) { 
-                    imgData.data[i * 4 + 0] = 249; // R (Orange)
-                    imgData.data[i * 4 + 1] = 115; // G
-                    imgData.data[i * 4 + 2] = 22;  // B
-                    imgData.data[i * 4 + 3] = 160; // Alpha
+                    imgData.data[i * 4 + 0] = 249; 
+                    imgData.data[i * 4 + 1] = 115; 
+                    imgData.data[i * 4 + 2] = 22;  
+                    imgData.data[i * 4 + 3] = 160; 
                 } else {
                     imgData.data[i * 4 + 3] = 0;    
                 }
@@ -157,8 +177,9 @@ export default function Segmenter() {
             maskCtx.putImageData(imgData, 0, 0);
             setStatus("SEGMENTATION COMPLETE. AWAITING NEXT TARGET.");
 
-        } catch (err) {
-            console.error(err);
+        } catch (err: any) {
+            console.error("Decoder Error:", err);
+            alert(`DECODER ERROR: ${err.message || err}`);
             setStatus("ERR: DECODER CORE FAULT.");
         }
     };
@@ -166,7 +187,6 @@ export default function Segmenter() {
     return (
         <div className="min-h-screen bg-[#050505] text-zinc-300 font-sans tracking-tight p-8 flex flex-col items-center">
             
-            {/* Minimalist Header */}
             <div className="w-full max-w-5xl mb-12 border-b border-zinc-800 pb-6 flex justify-between items-end">
                 <div>
                     <h1 className="text-3xl font-medium text-white tracking-tight">Diagnostic <span className="text-orange-500 font-normal">Engine</span></h1>
@@ -180,7 +200,6 @@ export default function Segmenter() {
 
             <div className="w-full max-w-5xl grid grid-cols-1 md:grid-cols-3 gap-8">
                 
-                {/* Control Panel (Sidebar) */}
                 <div className="col-span-1 space-y-6">
                     <div className="bg-[#0A0A0A] border border-zinc-800 p-6 rounded-sm">
                         <h2 className="text-white text-sm uppercase tracking-widest mb-4 border-b border-zinc-800 pb-2">Data Input</h2>
@@ -211,7 +230,6 @@ export default function Segmenter() {
                     </div>
                 </div>
 
-                {/* Main Viewport */}
                 <div className="col-span-1 md:col-span-2">
                     <div className="bg-[#0A0A0A] border border-zinc-800 rounded-sm p-1 min-h-[500px] flex items-center justify-center relative overflow-hidden">
                         
@@ -222,7 +240,6 @@ export default function Segmenter() {
                             </div>
                         )}
 
-                        {/* Image & Canvas Wrapper */}
                         <div className={`relative inline-block max-w-full shadow-2xl ${isProcessing && 'opacity-50 transition-opacity'}`}>
                             <canvas ref={canvasRef} className="block max-w-full h-auto" />
                             <canvas 
