@@ -6,9 +6,8 @@ import { UploadCloud, Loader2, MousePointer2 } from 'lucide-react';
 
 // Configure ONNX Runtime
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
-ort.env.wasm.numThreads = 1; // Prevents Web Worker memory spikes in Codespaces
+ort.env.wasm.numThreads = 1;
 
-// URLs pointing directly to your final quantized model
 const ENCODER_URL = "https://huggingface.co/AnberAziz5/sam-web-models/resolve/main/sam_image_encoder_quantized.onnx";
 const DECODER_URL = "https://huggingface.co/AnberAziz5/sam-web-models/resolve/main/sam_mask_decoder_final.onnx";
 
@@ -23,15 +22,12 @@ export default function Segmenter() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const maskCanvasRef = useRef<HTMLCanvasElement>(null);
 
-    // 1. Clean, native model loading with aggressive memory optimizations
     useEffect(() => {
         async function loadModels() {
             try {
                 setStatus("Downloading Quantized Encoder (~95MB)...");
                 const encSession = await ort.InferenceSession.create(ENCODER_URL, {
-                    // Try GPU acceleration first, fallback to WASM
-                    executionProviders: ['webgl', 'wasm'],
-                    // Aggressive memory optimizations to prevent tab crashing
+                    executionProviders: ['wasm'], // Cleaned up to stop WebGL console spam
                     graphOptimizationLevel: 'all',
                     enableCpuMemArena: true,
                     enableMemPattern: true,
@@ -41,14 +37,14 @@ export default function Segmenter() {
 
                 setStatus("Downloading & Compiling Decoder...");
                 const decSession = await ort.InferenceSession.create(DECODER_URL, {
-                    executionProviders: ['webgl', 'wasm']
+                    executionProviders: ['wasm']
                 });
                 setDecoderSession(decSession);
 
                 setStatus("Models loaded. Ready for medical image.");
-            } catch (error) {
+            } catch (error: any) {
                 console.error("Model loading failed:", error);
-                setStatus("Error loading models. Check console.");
+                setStatus(`Error loading models: ${error.message || error}`);
             }
         }
         loadModels();
@@ -86,10 +82,10 @@ export default function Segmenter() {
     const runEncoder = async (img: HTMLImageElement) => {
         if (!encoderSession) return;
         setIsProcessing(true);
-        setStatus("Processing image through LoRA Encoder... (This takes heavy RAM)");
+        setStatus("Processing image through LoRA Encoder... (This takes heavy RAM, wait 15-30s)");
 
-        // Give the browser 100ms to visually update the UI before freezing the thread with heavy math
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Force DOM to paint the status update before locking the CPU
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
         try {
             const offscreen = document.createElement('canvas');
@@ -119,21 +115,24 @@ export default function Segmenter() {
             }
 
             const inputTensor = new ort.Tensor('float32', tensorObj, [1, 3, 1024, 1024]);
-            
-            // Execute the model inference
             const results = await encoderSession.run({ input_image: inputTensor });
             
             setImageEmbedding(results.image_embeddings);
             setStatus("Ready! Click anywhere on the image to segment polyps/tumors.");
-        } catch (error) {
+        } catch (error: any) {
             console.error("Encoder failed:", error);
-            setStatus("Encoder failed. Check DevTools console (F12) for the exact memory error.");
+            alert(`Encoder failed: ${error.message || "Out of Memory"}`);
+            setStatus("Encoder failed. Check DevTools console.");
         }
         setIsProcessing(false);
     };
 
     const handleCanvasClick = async (e: React.MouseEvent<HTMLCanvasElement>) => {
-        if (!decoderSession || !imageEmbedding || !image || isProcessing) return;
+        // Prevent early exit silence: log exactly why it rejects the click
+        if (!decoderSession || !imageEmbedding || !image || isProcessing) {
+            console.log("Click ignored. State:", { hasDecoder: !!decoderSession, hasEmbedding: !!imageEmbedding, isProcessing });
+            return;
+        }
         
         const canvas = maskCanvasRef.current;
         if (!canvas) return;
@@ -145,6 +144,15 @@ export default function Segmenter() {
         const y = (e.clientY - rect.top) * scaleY;
 
         setStatus(`Segmenting at (${Math.round(x)}, ${Math.round(y)})...`);
+
+        const maskCtx = canvas.getContext('2d');
+        if (!maskCtx) return;
+
+        // Visual click confirmation (draws a tiny red dot so you know it registered)
+        maskCtx.fillStyle = 'red';
+        maskCtx.beginPath();
+        maskCtx.arc(x, y, 5, 0, 2 * Math.PI);
+        maskCtx.fill();
         
         try {
             const pointCoords = new Float32Array([x, y]);
@@ -173,9 +181,6 @@ export default function Segmenter() {
             const h = maskTensor.dims[2];
             const w = maskTensor.dims[3];
             
-            const maskCtx = canvas.getContext('2d');
-            if (!maskCtx) return;
-            
             const imgData = maskCtx.createImageData(w, h);
             for(let i = 0; i < h * w; i++) {
                 if(maskData[i] > 0.0) { 
@@ -190,8 +195,9 @@ export default function Segmenter() {
             maskCtx.putImageData(imgData, 0, 0);
             setStatus("Ready! Click anywhere else to re-segment.");
 
-        } catch (err) {
-            console.error(err);
+        } catch (err: any) {
+            console.error("DECODER ERROR:", err);
+            alert(`Decoder failed: ${err.message || err}`);
             setStatus("Decoder failed. Check console.");
         }
     };
@@ -223,13 +229,16 @@ export default function Segmenter() {
                     </div>
                 )}
 
-                <div className="relative flex justify-center w-full overflow-hidden rounded-lg bg-black border border-gray-700">
-                    <canvas ref={canvasRef} className="max-w-full h-auto z-10" />
-                    <canvas 
-                        ref={maskCanvasRef} 
-                        onClick={handleCanvasClick}
-                        className={`absolute top-0 max-w-full h-auto z-20 ${imageEmbedding && !isProcessing ? 'cursor-crosshair' : 'cursor-wait'}`} 
-                    />
+                {/* FIXED CSS WRAPPER: inline-block locks the container strictly to the canvas size */}
+                <div className="flex justify-center w-full">
+                    <div className="relative inline-block max-w-full overflow-hidden rounded-lg bg-black border border-gray-700 shadow-lg">
+                        <canvas ref={canvasRef} className="block max-w-full h-auto z-10" />
+                        <canvas 
+                            ref={maskCanvasRef} 
+                            onClick={handleCanvasClick}
+                            className={`absolute top-0 left-0 w-full h-full z-20 ${imageEmbedding && !isProcessing ? 'cursor-crosshair' : 'cursor-wait'}`} 
+                        />
+                    </div>
                 </div>
             </div>
         </div>
